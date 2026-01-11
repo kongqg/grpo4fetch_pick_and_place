@@ -158,7 +158,7 @@ class CriticNetwork(nn.Module):
         self.load_state_dict(torch.load(self.checkpoint_file, map_location=self.device))
 
 
-class PPOAgent:
+class GRPOAgent:
     def __init__(self, n_actions, input_dims, gamma=0.99, alpha=1e-4, gae_lambda=0.95,
                  policy_clip=0.2, batch_size=64, N=2048, n_epochs=3):
         self.gamma = gamma
@@ -286,153 +286,130 @@ class PPOAgent:
 
         return action_np, log_prob_item, value_item
 
-    def learn(self, debug: bool = False, debug_every: int = 1):
+    def learn_grpo(self, debug: bool = False):
+        """
+        GRPO-style policy update (no value network):
+        - Collect a *group* of full trajectories into memory
+        - Compute each trajectory return G_i, baseline = mean(G_i)
+        - Advantage for every step in trajectory i: A_t = (G_i - baseline)
+        - Do ONE full-batch PPO clipped policy update using this advantage
+        """
         device = self.actor.device
         target_kl = 0.02
 
-        # ===== 1) 取出 buffer（只取一次，不要每个 epoch 都重新 generate）=====
-        state_arr, action_arr, old_logp_arr, vals_arr, reward_arr, done_arr, _ = self.memory.generate_batches()
+        state_arr, action_arr, old_logp_arr, _, reward_arr, done_arr, _ = self.memory.generate_batches()
 
         rewards = reward_arr.astype(np.float32)
-        dones = done_arr.astype(np.float32)
-        values = vals_arr.astype(np.float32)
+        dones = done_arr.astype(np.bool_)
         T = len(rewards)
+        if T == 0:
+            return None
 
-        adv = np.zeros(T, dtype=np.float32)
-        last_gae = 0.0
+        # ---- split into complete episodes using dones ----
+        ep_ends = np.where(dones)[0]
+        if ep_ends.size == 0:
+            return None
 
-        for t in reversed(range(T)):
-            next_value = values[t + 1] if (t + 1) < T else 0.0
-            next_nonterminal = 1.0 - dones[t]  # done=True -> 0
+        # drop tail (incomplete episode)
+        T_full = int(ep_ends[-1] + 1)
+        state_arr = state_arr[:T_full]
+        action_arr = action_arr[:T_full]
+        old_logp_arr = old_logp_arr[:T_full]
+        rewards = rewards[:T_full]
+        dones = dones[:T_full]
+        ep_ends = ep_ends[ep_ends < T_full]
 
-            delta = rewards[t] + self.gamma * next_value * next_nonterminal - values[t]
-            last_gae = delta + self.gamma * self.gae_lambda * next_nonterminal * last_gae
-            adv[t] = last_gae
+        # episode returns
+        ep_returns = []
+        start = 0
+        for end in ep_ends:
+            G = float(rewards[start:end + 1].sum())
+            ep_returns.append(G)
+            start = end + 1
+        if len(ep_returns) == 0:
+            return None
 
-        # 这里的 returns 是 critic 的监督目标（不要用标准化后的 adv）
-        returns = adv + values
+        baseline = float(np.mean(ep_returns))
 
-        # PPO 通常要标准化 advantage（更稳）
-        adv_mean = adv.mean()
-        adv_std = adv.std() + 1e-8
+        # advantage: per step uses (G_i - baseline)
+        adv = np.zeros(T_full, dtype=np.float32)
+        start = 0
+        for G, end in zip(ep_returns, ep_ends):
+            adv[start:end + 1] = (G - baseline)
+            start = end + 1
+
+        # normalize advantage
+        adv_mean = float(adv.mean())
+        adv_std = float(adv.std() + 1e-8)
         adv_norm = (adv - adv_mean) / adv_std
 
-        # ===== 3) 开始 PPO 更新 =====
-        n_states = len(state_arr)
-        batch_size = self.memory.batch_size
+        # -------- full batch tensors --------
+        states = torch.tensor(state_arr, dtype=torch.float32, device=device)
+        actions = torch.tensor(action_arr, dtype=torch.float32, device=device)
+        old_logp = torch.tensor(old_logp_arr, dtype=torch.float32, device=device)
+        adv_b = torch.tensor(adv_norm, dtype=torch.float32, device=device)
+
+        mu, std = self.actor(states)
+        dist = Normal(mu, std)
+
+        # actions are tanh-squashed -> invert to raw_action for correct log_prob
+        eps = 1e-6
+        a = torch.clamp(actions, -1 + eps, 1 - eps)
+        raw_action = 0.5 * (torch.log1p(a) - torch.log1p(-a))  # atanh(a)
+
+        new_logp = self._tanh_squash_log_prob(dist, raw_action, actions)
+
+        prob_ratio = torch.exp(new_logp - old_logp)
+        surr1 = prob_ratio * adv_b
+        surr2 = torch.clamp(prob_ratio, 1 - self.policy_clip, 1 + self.policy_clip) * adv_b
+        actor_loss = -torch.min(surr1, surr2).mean()
+
+        entropy = dist.entropy().sum(dim=-1).mean()
+        total_loss = actor_loss - 0.01 * entropy
+
+        self.actor.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+        self.actor.optimizer.step()
+
+        # debug metrics (full-batch)
         stats = {}
-        for epoch in range(self.n_epochs):
-            # 每个 epoch 重新 shuffle index（等价于你之前每次 generate_batches 的随机性）
-            idx = np.arange(n_states, dtype=np.int64)
-            np.random.shuffle(idx)
-            batches = [idx[i:i + batch_size] for i in range(0, n_states, batch_size)]
+        if debug:
+            with torch.no_grad():
+                clip_frac = ((prob_ratio > 1 + self.policy_clip) | (
+                            prob_ratio < 1 - self.policy_clip)).float().mean().item()
+                approx_kl = (old_logp - new_logp).mean().item()
+                ratio_max = prob_ratio.max().item()
+                ratio_min = prob_ratio.min().item()
+                std_mean = std.mean().item()
+                ent = entropy.item()
 
-            # debug 聚合
-            dbg_actor_losses = []
-            dbg_critic_losses = []
-            dbg_kls = []
-            dbg_clip_fracs = []
-            dbg_ratio_max = []
-            dbg_ratio_min = []
-            dbg_std_mean = []
+            if approx_kl > 1.5 * target_kl:
+                print(f"[GRPO] kl too large in single-step update: kl={approx_kl:.4f} (target {target_kl})")
 
-            for batch in batches:
-                states = torch.tensor(state_arr[batch], dtype=torch.float32, device=device)
-                actions = torch.tensor(action_arr[batch], dtype=torch.float32, device=device)  # (B, n_actions)
-                old_logp = torch.tensor(old_logp_arr[batch], dtype=torch.float32, device=device)  # (B,)
+            print(
+                f"[GRPO dbg] "
+                f"actor_loss={actor_loss.item():.4f} "
+                f"kl~={approx_kl:.4f} "
+                f"clip%={clip_frac * 100:.1f}% "
+                f"ratio[min,max]=[{ratio_min:.3f},{ratio_max:.3f}] "
+                f"std_mean={std_mean:.3f} "
+                f"entropy={ent:.3f} "
+                f"baseline={baseline:.3f} adv_raw(mu/std)={adv_mean:.3f}/{adv_std:.3f} "
+                f"n_traj={len(ep_returns)}"
+            )
 
-                adv_b = torch.tensor(adv_norm[batch], dtype=torch.float32,
-                                     device=device)  # 用标准化 advantage 做 policy loss
-                ret_b = torch.tensor(returns[batch], dtype=torch.float32, device=device)  # 用未标准化 returns 做 value loss
-
-                # ===== critic =====
-                critic_value = self.critic(states).squeeze(-1)  # (B,)
-
-                # ===== actor: 重新算 new_logp =====
-                mu, std = self.actor(states)
-                dist = Normal(mu, std)
-
-                # actions 是环境动作（tanh 后），需要 atanh 反解成 raw_action 来做 squash 修正
-                eps = 1e-6
-                a = torch.clamp(actions, -1 + eps, 1 - eps)
-                raw_action = 0.5 * (torch.log1p(a) - torch.log1p(-a))  # atanh(a)
-
-                new_logp = self._tanh_squash_log_prob(dist, raw_action, actions)  # (B,)
-
-                # ===== PPO ratio & clipped objective =====
-                prob_ratio = torch.exp(new_logp - old_logp)  # (B,)
-
-                surr1 = prob_ratio * adv_b
-                surr2 = torch.clamp(prob_ratio, 1 - self.policy_clip, 1 + self.policy_clip) * adv_b
-                actor_loss = -torch.min(surr1, surr2).mean()
-
-                # value loss
-                critic_loss = (ret_b - critic_value).pow(2).mean()
-
-                entropy = dist.entropy().sum(dim=-1).mean()
-                total_loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
-
-                self.actor.optimizer.zero_grad()
-                self.critic.optimizer.zero_grad()
-                total_loss.backward()
-
-                # 可选：梯度裁剪（更稳）
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-
-                self.actor.optimizer.step()
-                self.critic.optimizer.step()
-
-                # ===== debug 收集 =====
-                if debug:
-                    with torch.no_grad():
-                        clip_frac = ((prob_ratio > 1 + self.policy_clip) | (
-                                    prob_ratio < 1 - self.policy_clip)).float().mean().item()
-                        approx_kl = (old_logp - new_logp).mean().item()  # 粗略KL
-                        dbg_actor_losses.append(actor_loss.item())
-                        dbg_critic_losses.append(critic_loss.item())
-                        dbg_kls.append(approx_kl)
-                        dbg_clip_fracs.append(clip_frac)
-                        dbg_ratio_max.append(prob_ratio.max().item())
-                        dbg_ratio_min.append(prob_ratio.min().item())
-                        dbg_std_mean.append(std.mean().item())
-            # ===== 每个 epoch 后做 early stop =====
-            if debug and len(dbg_kls) > 0:
-                mean_kl = float(np.mean(dbg_kls))
-                if mean_kl > 1.5 * target_kl:
-                    if debug:
-                        print(f"[PPO] early stop at epoch {epoch + 1}, kl={mean_kl:.4f}")
-                    break
-
-            actor_loss_mean = float(np.mean(dbg_actor_losses)) if dbg_actor_losses else 0.0
-            critic_loss_mean = float(np.mean(dbg_critic_losses)) if dbg_critic_losses else 0.0
-            mean_kl = float(np.mean(dbg_kls)) if dbg_kls else 0.0
-            clip_frac = float(np.mean(dbg_clip_fracs)) if dbg_clip_fracs else 0.0
-            ratio_min = float(np.min(dbg_ratio_min)) if dbg_ratio_min else 1.0
-            ratio_max = float(np.max(dbg_ratio_max)) if dbg_ratio_max else 1.0
-            std_mean = float(np.mean(dbg_std_mean)) if dbg_std_mean else 0.0
-            # 每隔 debug_every 个 epoch 打印一次（避免刷屏）
-            if debug and ((epoch % debug_every) == 0):
-                print(
-                    f"[PPO dbg][epoch {epoch + 1}/{self.n_epochs}] "
-                    f"actor_loss={np.mean(dbg_actor_losses):.4f} "
-                    f"critic_loss={np.mean(dbg_critic_losses):.4f} "
-                    f"kl~={np.mean(dbg_kls):.4f} "
-                    f"clip%={np.mean(dbg_clip_fracs) * 100:.1f}% "
-                    f"ratio[min,max]=[{np.min(dbg_ratio_min):.3f},{np.max(dbg_ratio_max):.3f}] "
-                    f"std_mean={np.mean(dbg_std_mean):.3f} "
-                    f"adv_raw(mu/std)={adv_mean:.3f}/{adv_std:.3f}"
-                )
             stats = {
-                "loss/actor": actor_loss.item(),
-                "loss/critic": critic_loss.item(),
-                "debug/kl": mean_kl,
-                "debug/clip_frac": clip_frac,
-                "debug/ratio_max": ratio_max,
-                "debug/std_mean": std_mean,
+                "loss/actor": float(actor_loss.item()),
+                "debug/kl": float(approx_kl),
+                "debug/clip_frac": float(clip_frac),
+                "debug/ratio_max": float(ratio_max),
+                "debug/std_mean": float(std_mean),
+                "grpo/baseline": baseline,
+                "grpo/n_traj": float(len(ep_returns)),
             }
 
-        # ===== 4) 清空 buffer =====
         self.memory.clear_memory()
         return stats
+
 
