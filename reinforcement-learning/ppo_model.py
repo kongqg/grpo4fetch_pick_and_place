@@ -4,12 +4,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from typing import List, Tuple
+
+from torch.distributions import Normal
 from torch.distributions.categorical import Categorical
 
 class PPOMemory:
     """
         A class to handle memory for the PPO reinforcement learning algorithm.
-    
+
     Attributes:
         batch_size (int): The size of each batch for training.
         states (List): List of stored states.
@@ -94,105 +96,51 @@ class PPOMemory:
         self.vals = []
 
 class ActorNetwork(nn.Module):
-    """
-    Neural network representing the actor in the PPO algorithm.
-
-    The actor generates a policy (probability distribution) over actions given an input state.
-
-    Attributes:
-        checkpoint_file (str): Path to the file where the model's weights are saved.
-        action (nn.Sequential): Sequential layers defining the policy network.
-        optimizer (torch.optim.Optimizer): Optimizer for training the actor network.
-        device (torch.device): Device (CPU or GPU) where the network is hosted.
-    """
     def __init__(self, n_actions, input_dims, alpha, fc1_dims=256, fc2_dims=256, chkpt_dir='checkpoints/ppo'):
-        """
-        Initialize the ActorNetwork.
-
-        Args:
-            n_actions (int): Number of possible actions.
-            input_dims (tuple): Dimensions of the input state.
-            alpha (float): Learning rate for the optimizer.
-            fc1_dims (int, optional): Number of neurons in the first fully connected layer. Defaults to 256.
-            fc2_dims (int, optional): Number of neurons in the second fully connected layer. Defaults to 256.
-            chkpt_dir (str, optional): Directory to save model checkpoints. Defaults to 'checkpoints/ppo'.
-        """
-        super(ActorNetwork, self).__init__()
-
+        super().__init__()
         self.checkpoint_file = os.path.join(chkpt_dir, 'actor_torch_ppo')
-        self.actor = nn.Sequential(
-            nn.Linear(*input_dims, fc1_dims), # unpack for linear input dims.
+
+        self.net = nn.Sequential(
+            nn.Linear(*input_dims, fc1_dims),
             nn.ReLU(),
             nn.Linear(fc1_dims, fc2_dims),
             nn.ReLU(),
-            nn.Linear(fc2_dims, n_actions), # Select one of the possible actions to take 
-            nn.Softmax(dim=-1) 
         )
+        self.mu = nn.Linear(fc2_dims, n_actions)
 
-        self.optimizer = optim.Adam(self.parameters(), lr=alpha) # GOAT optimizer
+        # 用一个可学习的 log_std（每个动作维度一个）
+        self.log_std = nn.Parameter(torch.ones(n_actions) * -1.5)
+
+        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(self.device)
-    
+
     def forward(self, state):
-        """
-        Perform a forward pass through the network to generate an action distribution.
+        h = self.net(state)
+        mu = self.mu(h)  # (B, n_actions)
+        log_std = torch.clamp(self.log_std, -5, 2)
+        std = torch.exp(log_std).expand_as(mu) # (B, n_actions)
+        return mu, std
 
-        Args:
-            state (torch.Tensor): Input state tensor.
-
-        Returns:
-            Categorical: A categorical distribution over possible actions.
-        """
-        dist = self.actor(state)
-        dist = Categorical(dist) # convert the state space into a categorical distribution
-
-        return dist
-    
     def save_checkpoint(self):
-        """
-        Save the model weights to a checkpoint file.
-        """
+        os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
         torch.save(self.state_dict(), self.checkpoint_file)
-    
+
     def load_checkpoint(self):
-        """
-        Load the model weights from a checkpoint file.
-        """
-        self.load_state_dict(torch.load(self.checkpoint_file))
+        self.load_state_dict(torch.load(self.checkpoint_file, map_location=self.device))
+
 
 class CriticNetwork(nn.Module):
-    """
-    Neural network representing the critic in the PPO algorithm.
+    def __init__(self, input_dims, alpha, fc1_dims=256, fc2_dims=256, chkpt_dir='checkpoints/ppo'):
+        super().__init__()
+        self.checkpoint_file = os.path.join(chkpt_dir, 'critic_torch_ppo')
 
-    The critic estimates the value of a given state. Used to calculate
-    advantages during training.
-
-    Attributes:
-        checkpoint_file (str): Path to the file where the model's weights are saved.
-        critic (nn.Sequential): Sequential layers defining the value network.
-        optimizer (torch.optim.Optimizer): Optimizer for training the critic network.
-        device (torch.device): Device (CPU or GPU) where the network is hosted.
-    """
-    def __init__ (self, input_dims, alpha, fc1_dims=256, fc2_dims=256, chkpt_dir='checkpoints/ppo'):
-        """
-        Initialize the CriticNetwork.
-
-        Args:
-            input_dims (tuple): Dimensions of the input state.
-            alpha (float): Learning rate for the optimizer.
-            fc1_dims (int, optional): Number of neurons in the first fully connected layer. Defaults to 256.
-            fc2_dims (int, optional): Number of neurons in the second fully connected layer. Defaults to 256.
-            chkpt_dir (str, optional): Directory to save model checkpoints. Defaults to 'checkpoints/ppo'.
-        """
-        super(CriticNetwork, self).__init__()
-
-        self.checkpoint_file = os.path.join(chkpt_dir, 'critic_torch_ppo') 
         self.critic = nn.Sequential(
             nn.Linear(*input_dims, fc1_dims),
             nn.ReLU(),
             nn.Linear(fc1_dims, fc2_dims),
             nn.ReLU(),
-            nn.Linear(fc2_dims, 1) # Estimated value of the input state.
+            nn.Linear(fc2_dims, 1),
         )
 
         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
@@ -200,34 +148,19 @@ class CriticNetwork(nn.Module):
         self.to(self.device)
 
     def forward(self, state):
-        """
-        Perform a forward pass through the network to estimate the value of the input state.
-
-        Args:
-            state (torch.Tensor): Input state tensor.
-
-        Returns:
-            value (torch.Tensor): Estimated value of the input state.
-        """
-        value = self.critic(state)
-
-        return value
+        return self.critic(state)
 
     def save_checkpoint(self):
-        """
-        Save the model weights to a checkpoint file.
-        """
+        os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
         torch.save(self.state_dict(), self.checkpoint_file)
-    
+
     def load_checkpoint(self):
-        """
-        Load the model weights from a checkpoint file.
-        """
-        self.load_state_dict(torch.load(self.checkpoint_file))
+        self.load_state_dict(torch.load(self.checkpoint_file, map_location=self.device))
 
 
 class Agent:
-    def __init__(self, n_actions, input_dims, gamma=0.99, alpha=0.0003, gae_lambda=0.95, policy_clip=0.2, batch_size=64, N=2048, n_epochs=10):
+    def __init__(self, n_actions, input_dims, gamma=0.99, alpha=0.0003, gae_lambda=0.95,
+                 policy_clip=0.2, batch_size=64, N=2048, n_epochs=10):
         self.gamma = gamma
         self.policy_clip = policy_clip
         self.n_epochs = n_epochs
@@ -237,96 +170,237 @@ class Agent:
         self.critic = CriticNetwork(input_dims, alpha)
         self.memory = PPOMemory(batch_size)
 
-    def remember(self, state, action, probs, vals, reward, done):
-        self.memory.store_memory(state, action, probs, vals, reward, done)
-    
+    def load_bc_weights(self, bc_state):
+        """
+        Load Behavior Cloning (BC) weights into PPO actor network.
+        Copies BC MLP weights into PPO ActorNetwork (net.0, net.2, mu).
+
+        Args:
+            bc_state (dict): state_dict from BCnetwork (keys like network.fc1.weight)
+        """
+
+        # --- 兼容：有些保存会包一层 ---
+        if isinstance(bc_state, dict) and "model" in bc_state:
+            bc_state = bc_state["model"]
+        if isinstance(bc_state, dict) and "state_dict" in bc_state:
+            bc_state = bc_state["state_dict"]
+
+        actor_state = self.actor.state_dict()
+
+        # === Sanity check: BC keys 必须存在 ===
+        required_bc_keys = [
+            "network.fc1.weight",
+            "network.fc1.bias",
+            "network.fc2.weight",
+            "network.fc2.bias",
+            "network.fc3.weight",
+            "network.fc3.bias",
+        ]
+        for k in required_bc_keys:
+            if k not in bc_state:
+                raise KeyError(f"[BC LOAD ERROR] Missing key in bc_state: {k}")
+
+        # === PPO actor 对应的 keys（你 PPO 里是 self.net + self.mu）===
+        mapping = {
+            "network.fc1.weight": "net.0.weight",
+            "network.fc1.bias": "net.0.bias",
+            "network.fc2.weight": "net.2.weight",
+            "network.fc2.bias": "net.2.bias",
+            "network.fc3.weight": "mu.weight",
+            "network.fc3.bias": "mu.bias",
+        }
+
+        # === 强校验：key 必须存在且 shape 必须一致（否则直接报错，避免“假加载”）===
+        for bc_k, ppo_k in mapping.items():
+            if ppo_k not in actor_state:
+                raise KeyError(f"[BC LOAD ERROR] PPO actor missing key: {ppo_k}")
+
+            if actor_state[ppo_k].shape != bc_state[bc_k].shape:
+                raise RuntimeError(
+                    f"[BC LOAD ERROR] Shape mismatch for {ppo_k}: "
+                    f"PPO {tuple(actor_state[ppo_k].shape)} vs BC {tuple(bc_state[bc_k].shape)}"
+                )
+
+            actor_state[ppo_k] = bc_state[bc_k]
+
+        # === 加载回 actor ===
+        self.actor.load_state_dict(actor_state)
+
+        print("[INFO] BC weights loaded into PPO actor: net.0/net.2/mu (mu network only).")
+
+    def remember(self, state, action, log_prob, val, reward, done):
+        self.memory.store_memory(state, action, log_prob, val, reward, done)
+
     def save_models(self):
-        """
-        Save checkpoints for the actor and critic model.
-        """
         print('... saving models')
         self.actor.save_checkpoint()
         self.critic.save_checkpoint()
 
     def load_models(self):
-        """
-        Load updates for the actor and critic model.
-        """
         print("... loading model")
         self.actor.load_checkpoint()
         self.critic.load_checkpoint()
 
+    @staticmethod
+    def _tanh_squash_log_prob(dist: Normal, raw_action: torch.Tensor, squashed_action: torch.Tensor):
+        """
+        对 tanh squashing 做 log_prob 修正：
+        log π(a) = log N(u|μ,σ) - sum log(1 - tanh(u)^2)
+        用tanh 限制在 -1，1之间，那原始的概率密度就变了，所以要变回去
+        """
+        # base log prob (B, n_actions)
+        logp_u = dist.log_prob(raw_action)
+        # sum over action dims -> (B,)
+        logp_u = logp_u.sum(dim=-1)
+
+        # correction term: sum log(1 - a^2 + eps)
+        eps = 1e-6
+        correction = torch.log(1.0 - squashed_action.pow(2) + eps).sum(dim=-1)
+
+        return logp_u - correction  # (B,)
+
     def choose_action(self, observation):
-        """
-        Samples an action from the current action space distribution.
+        state = torch.tensor([observation], dtype=torch.float32).to(self.actor.device)
 
-        Args:
-            observation (any): An observation of the current state.
-        
-        Returns:
-            action 
-        """
-        state = torch.tensor([observation], dtype=torch.float).to(self.actor.device)
+        with torch.no_grad():
+            mu, std = self.actor(state)
+            dist = Normal(mu, std)
 
-        dist = self.actor(state)
-        value = self.critic(state)
-        action = dist.sample()
+            raw_action = dist.rsample()              # (1, n_actions)
+            action = torch.tanh(raw_action)          # [-1,1], (1, n_actions)
 
-        probs = torch.squeeze(dist.log_prob(action)).item()
-        action = torch.squeeze(action).item()
-        value = torch.squeeze(value).item()
+            value = self.critic(state).squeeze(-1)   # (1,)
+            log_prob = self._tanh_squash_log_prob(dist, raw_action, action)  # (1,)
 
-        return action, probs, value
+        action_np = action.squeeze(0).cpu().numpy().astype(np.float32)  # (n_actions,)
+        log_prob_item = log_prob.item()
+        value_item = value.item()
 
-    def learn(self):
-        for _ in range(self.n_epochs):
-            state_arr, action_arr, old_probs_arr, vals_arr, reward_arr, done_arr, batches = self.memory.generate_batches()
+        return action_np, log_prob_item, value_item
 
-            values = vals_arr
-            advantage = np.zeros(len(reward_arr), dtype=np.float32)
+    def learn(self, debug: bool = False, debug_every: int = 1):
+        device = self.actor.device
 
-            for t in range(len(reward_arr)-1):
-                discount = 1
-                advantage_t = 0
-                for k in range(t, len(reward_arr)-1):
-                    advantage_t += discount*(reward_arr[k] + self.gamma*values[k+1]*(1-int(done_arr[k])) - values[k])
-                    discount *= self.gamma*self.gae_lambda
-                advantage[t] = advantage_t
+        # ===== 1) 取出 buffer（只取一次，不要每个 epoch 都重新 generate）=====
+        state_arr, action_arr, old_logp_arr, vals_arr, reward_arr, done_arr, _ = self.memory.generate_batches()
 
-            advantage = torch.tensor(advantage).to(self.actor.device)
-            values = torch.tensor(values).to(self.actor.device)
+        rewards = reward_arr.astype(np.float32)
+        dones = done_arr.astype(np.float32)
+        values = vals_arr.astype(np.float32)
+        T = len(rewards)
+
+        adv = np.zeros(T, dtype=np.float32)
+        last_gae = 0.0
+
+        for t in reversed(range(T)):
+            next_value = values[t + 1] if (t + 1) < T else 0.0
+            next_nonterminal = 1.0 - dones[t]  # done=True -> 0
+
+            delta = rewards[t] + self.gamma * next_value * next_nonterminal - values[t]
+            last_gae = delta + self.gamma * self.gae_lambda * next_nonterminal * last_gae
+            adv[t] = last_gae
+
+        # 这里的 returns 是 critic 的监督目标（不要用标准化后的 adv）
+        returns = adv + values
+
+        # PPO 通常要标准化 advantage（更稳）
+        adv_mean = adv.mean()
+        adv_std = adv.std() + 1e-8
+        adv_norm = (adv - adv_mean) / adv_std
+
+        # ===== 3) 开始 PPO 更新 =====
+        n_states = len(state_arr)
+        batch_size = self.memory.batch_size
+
+        for epoch in range(self.n_epochs):
+            # 每个 epoch 重新 shuffle index（等价于你之前每次 generate_batches 的随机性）
+            idx = np.arange(n_states, dtype=np.int64)
+            np.random.shuffle(idx)
+            batches = [idx[i:i + batch_size] for i in range(0, n_states, batch_size)]
+
+            # debug 聚合
+            dbg_actor_losses = []
+            dbg_critic_losses = []
+            dbg_kls = []
+            dbg_clip_fracs = []
+            dbg_ratio_max = []
+            dbg_ratio_min = []
+            dbg_std_mean = []
 
             for batch in batches:
-                # pi(theta_old)
-                states = torch.tensor(state_arr[batch], dtype=torch.float).to(self.actor.device)
-                old_probs = torch.tensor(old_probs_arr[batch]).to(self.actor.device)
-                actions = torch.tensor(action_arr[batch]).to(self.actor.device)
+                states = torch.tensor(state_arr[batch], dtype=torch.float32, device=device)
+                actions = torch.tensor(action_arr[batch], dtype=torch.float32, device=device)  # (B, n_actions)
+                old_logp = torch.tensor(old_logp_arr[batch], dtype=torch.float32, device=device)  # (B,)
 
-                critic_value = self.critic(states)
-                critic_value = torch.squeeze(critic_value)
-                # pi(theta_new)
-                dist = self.actor(states)
-                new_probs = dist.log_prob(actions)
-                # pi(theta_new)/pi(theta_old)
-                prob_ratio = new_probs.exp() / old_probs.exp()
+                adv_b = torch.tensor(adv_norm[batch], dtype=torch.float32,
+                                     device=device)  # 用标准化 advantage 做 policy loss
+                ret_b = torch.tensor(returns[batch], dtype=torch.float32, device=device)  # 用未标准化 returns 做 value loss
 
-                # A^t
-                weighted_probs = advantage[batch] * prob_ratio
-                # Clipping function from fig.7 of PPO paper.
-                weighted_clipped_probs = torch.clamp(prob_ratio, 1-self.policy_clip, 1+self.policy_clip)*advantage[batch]
+                # ===== critic =====
+                critic_value = self.critic(states).squeeze(-1)  # (B,)
 
-                actor_loss = -torch.min(weighted_probs, weighted_clipped_probs).mean()
+                # ===== actor: 重新算 new_logp =====
+                mu, std = self.actor(states)
+                dist = Normal(mu, std)
 
-                returns = advantage[batch] + values[batch]
-                critic_loss = (returns-critic_value)**2
-                critic_loss = critic_loss.mean()
+                # actions 是环境动作（tanh 后），需要 atanh 反解成 raw_action 来做 squash 修正
+                eps = 1e-6
+                a = torch.clamp(actions, -1 + eps, 1 - eps)
+                raw_action = 0.5 * (torch.log1p(a) - torch.log1p(-a))  # atanh(a)
 
-                total_loss = actor_loss + 0.5*critic_loss
+                new_logp = self._tanh_squash_log_prob(dist, raw_action, actions)  # (B,)
+
+                # ===== PPO ratio & clipped objective =====
+                prob_ratio = torch.exp(new_logp - old_logp)  # (B,)
+
+                surr1 = prob_ratio * adv_b
+                surr2 = torch.clamp(prob_ratio, 1 - self.policy_clip, 1 + self.policy_clip) * adv_b
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                # value loss
+                critic_loss = (ret_b - critic_value).pow(2).mean()
+
+                entropy = dist.entropy().sum(dim=-1).mean()
+                total_loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+
                 self.actor.optimizer.zero_grad()
                 self.critic.optimizer.zero_grad()
                 total_loss.backward()
+
+                # 可选：梯度裁剪（更稳）
+                # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                # torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+
                 self.actor.optimizer.step()
                 self.critic.optimizer.step()
-            
-            self.memory.clear_memory()
+
+                # ===== debug 收集 =====
+                if debug:
+                    with torch.no_grad():
+                        clip_frac = ((prob_ratio > 1 + self.policy_clip) | (
+                                    prob_ratio < 1 - self.policy_clip)).float().mean().item()
+                        approx_kl = (old_logp - new_logp).mean().item()  # 粗略KL
+                        dbg_actor_losses.append(actor_loss.item())
+                        dbg_critic_losses.append(critic_loss.item())
+                        dbg_kls.append(approx_kl)
+                        dbg_clip_fracs.append(clip_frac)
+                        dbg_ratio_max.append(prob_ratio.max().item())
+                        dbg_ratio_min.append(prob_ratio.min().item())
+                        dbg_std_mean.append(std.mean().item())
+
+            # 每隔 debug_every 个 epoch 打印一次（避免刷屏）
+            if debug and ((epoch % debug_every) == 0):
+                print(
+                    f"[PPO dbg][epoch {epoch + 1}/{self.n_epochs}] "
+                    f"actor_loss={np.mean(dbg_actor_losses):.4f} "
+                    f"critic_loss={np.mean(dbg_critic_losses):.4f} "
+                    f"kl~={np.mean(dbg_kls):.4f} "
+                    f"clip%={np.mean(dbg_clip_fracs) * 100:.1f}% "
+                    f"ratio[min,max]=[{np.min(dbg_ratio_min):.3f},{np.max(dbg_ratio_max):.3f}] "
+                    f"std_mean={np.mean(dbg_std_mean):.3f} "
+                    f"adv_raw(mu/std)={adv_mean:.3f}/{adv_std:.3f}"
+                )
+
+        # ===== 4) 清空 buffer =====
+        self.memory.clear_memory()
 

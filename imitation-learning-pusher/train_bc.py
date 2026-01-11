@@ -8,6 +8,7 @@ import time
 
 from bc_network import BCnetwork
 from loader import load_dataset
+from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -26,10 +27,15 @@ def train_bc(model_name: str, data_path: str, batch_size: int, num_epochs: int):
     # Load in expert dataset
     dataloader, env = load_dataset(path=data_path, batch_size=batch_size)
     obs_space, act_space = env.observation_space, env.action_space
-    assert isinstance(obs_space, spaces.Box)
+    if isinstance(obs_space, spaces.Box):
+        input_dim = int(np.prod(obs_space.shape))
+    elif isinstance(obs_space, spaces.Dict):
+        input_dim = int(np.prod(obs_space["observation"].shape) + np.prod(obs_space["desired_goal"].shape) + np.prod(obs_space["achieved_goal"].shape))
+    else:
+        raise TypeError(f"Unsupported obs space type: {type(obs_space)}")
     assert isinstance(act_space, spaces.Box)
-    input_dim, output_dim = np.prod(obs_space.shape), np.prod(act_space.shape)
-
+    # input_dim, output_dim = np.prod(obs_space.shape), np.prod(act_space.shape)
+    output_dim =np.prod(act_space.shape)
     # Initialize model, loss function, optimizer
     model = BCnetwork(input_dim=input_dim, output_dim=output_dim).to(device)
     loss_fn = torch.nn.MSELoss()
@@ -54,7 +60,7 @@ def train_bc(model_name: str, data_path: str, batch_size: int, num_epochs: int):
 
         print(f"Current Epoch {epoch}/{num_epochs}; Loss: {batch_loss}")
         losses.append(running_loss / len(dataloader))
-
+    Path(model_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), model_path)
     print(f"---------- Model saved at {model_path}----------")
 
@@ -94,11 +100,11 @@ def evaluate_model(model_pth: str, env_id: str, n_episodes: int):
 
 if __name__ == "__main__":
 
-    n_epochs = 500
-    model_pth = "mujoco-pusher-v1"
+    n_epochs = 300
+    model_pth = "fetch_pick_and_place/expert-v0"
 
     # Uncomment to train a new model
-    # losses = train_bc(model_name=model_pth, data_path="pusher/expert-v2", batch_size=20, num_epochs=n_epochs)
+    losses = train_bc(model_name=model_pth, data_path="fetch_pick_and_place/expert-v0", batch_size=20, num_epochs=n_epochs)
     
     n_eps = 10
-    evaluate_model(model_pth, "Pusher-v5", n_eps)
+    # evaluate_model(model_pth, "Pusher-v5", n_eps)

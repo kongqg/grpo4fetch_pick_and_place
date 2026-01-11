@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from gymnasium import Env
 from torch.utils.data import DataLoader
@@ -5,6 +6,14 @@ import minari
 
 
 
+
+def _flatten_obs(obs):
+    if isinstance(obs, dict):
+        o = np.asarray(obs["observation"], dtype=np.float32)
+        a = np.asarray(obs["achieved_goal"], dtype=np.float32)
+        d = np.asarray(obs["desired_goal"], dtype=np.float32)
+
+        return np.concatenate([o, a, d], axis=-1)
 def load_dataset(path: str, batch_size: int) -> tuple[DataLoader, Env]:
     """
     Loads a dataset from a Minari file and recovers its environment.
@@ -20,6 +29,9 @@ def load_dataset(path: str, batch_size: int) -> tuple[DataLoader, Env]:
     """
     minari_dataset = minari.load_dataset(path)
     env = minari_dataset.recover_environment()
+    print("action_space:", env.action_space)
+    print("low:", env.action_space.low)
+    print("high:", env.action_space.high)
     print("----------Successfully loaded environment---------")
     print("Observation space:", minari_dataset.observation_space)
     print("Action space:", minari_dataset.action_space)
@@ -54,7 +66,7 @@ def collate_fn(batch):
     return {
         "id": torch.Tensor([x.id for x in batch]),
         "observations": torch.nn.utils.rnn.pad_sequence(
-            [torch.as_tensor(x.observations) for x in batch], batch_first=True
+            [torch.as_tensor(_flatten_obs(x.observations)) for x in batch], batch_first=True
         ),
         "actions": torch.nn.utils.rnn.pad_sequence(
             [torch.as_tensor(x.actions) for x in batch], batch_first=True
@@ -70,7 +82,7 @@ def collate_fn(batch):
 
 
 if __name__ == "__main__":
-    data_path = "pusher/expert-v1"
+    data_path = "FetchPickAndPlace-v0"
     batch_size = 100  # How many episodes per batch
     dataloader, env = load_dataset(data_path, batch_size)
 

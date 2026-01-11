@@ -19,15 +19,15 @@ class BCnetwork(nn.Module):
                 [
                     ("fc1", nn.Linear(input_dim, 256)),
                     ("relu1", nn.ReLU()),
-                    ("fc2", nn.Linear(256, 128)),
+                    ("fc2", nn.Linear(256, 256)),
                     ("relu2", nn.ReLU()),
-                    ("fc3", nn.Linear(128, output_dim)),
+                    ("fc3", nn.Linear(256, output_dim)),
                     ("tanh", nn.Tanh()),  # Squish between [-1, 1]
                 ]
             )
         )
 
-        self.scalar = 2.0
+        self.scalar = 1.0
 
     def forward(self, x):
         """
@@ -40,7 +40,7 @@ class BCnetwork(nn.Module):
             output (Tensor): Output of the model
         """
         output = self.network(x)
-        output = output * self.scalar  # Action space values need to be [-2, 2]
+        output = output * self.scalar  # Action space values need to be [-1, 1]
         return output
 
 

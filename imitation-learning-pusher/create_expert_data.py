@@ -7,11 +7,17 @@ import gymnasium as gym
 from tqdm import tqdm
 from minari import DataCollector
 import time
+from sb3_contrib import TQC
+import gymnasium_robotics
+gym.register_envs(gymnasium_robotics)
 
-REPO_ID = "farama-minari/Pusher-v5-SAC-expert"
-FILENAME = "pusher-v5-sac-expert.zip"
-ENV_ID = "Pusher-v5"
+# REPO_ID = "farama-minari/Pusher-v5-SAC-expert"
+# FILENAME = "pusher-v5-sac-expert.zip"
+# ENV_ID = "Pusher-v5"
 
+REPO_ID = "crislmfroes/tqc-FetchPickAndPlace-v2"
+FILENAME = "tqc-FetchPickAndPlace-v2.zip"
+ENV_ID = "FetchPickAndPlace-v4"
 
 def get_expert_demo(dataset_id: str, n_episodes:int=100, visualize:bool = True) -> None:
     """
@@ -24,13 +30,13 @@ def get_expert_demo(dataset_id: str, n_episodes:int=100, visualize:bool = True) 
         visualize (bool): Visualizes the expert demonstration when True
     """
 
-
-    render_mode = 'human' if visualize else "rgb_array"
-    env = DataCollector(gym.make(ENV_ID, render_mode = render_mode))
-
-    # Load pretrained expert from Huggingface
+    render_mode = "human"
+    # 1) 给模型 load 用的 env（关键）
+    raw_env = gym.make(ENV_ID, render_mode=None)  # 不渲染也行
+    # 2) 录制用 env
+    env = DataCollector(gym.make(ENV_ID, render_mode=render_mode))
     checkpoint = load_from_hub(repo_id=REPO_ID, filename=FILENAME)
-    expert = SAC.load(checkpoint)
+    expert = TQC.load(checkpoint, env=raw_env)
 
     print("----------Getting expert demonstration----------")
     for i in tqdm(range(n_episodes)):
@@ -49,11 +55,11 @@ def get_expert_demo(dataset_id: str, n_episodes:int=100, visualize:bool = True) 
     # Change this if needed
     env.create_dataset(
         dataset_id = dataset_id,
-        algorithm_name="ExpertPolicy",
+        algorithm_name="TQC_ExpertPolicy",
         code_permalink="https://github.com/dokyun-kim4/rl-pusher",
-        author="dokyun-kim4",
-        author_email="dkim4@olin.edu",
-        description="Pusher expert policy",
+        author="kqg",
+        author_email="kongqg574@outlook.com",
+        description="FetchPickAndPlace expert demonstrations (expert from HF, collected on FetchPickAndPlace-v3)",
         eval_env=ENV_ID
     )
     env.close()
@@ -63,5 +69,5 @@ def get_expert_demo(dataset_id: str, n_episodes:int=100, visualize:bool = True) 
 
 if __name__ == "__main__":
     # Change the version accordingly
-    dataset_id = "pusher/expert-v3"
-    get_expert_demo(dataset_id, n_episodes=5_000, visualize=True)
+    dataset_id = "fetch_pick_and_place/expert-v0"
+    get_expert_demo(dataset_id, n_episodes=2_000, visualize=True)
