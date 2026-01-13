@@ -100,7 +100,7 @@ def evaluate_model(model_pth: str, env_id: str, n_episodes: int):
 
 if __name__ == "__main__":
 
-    n_epochs = 300
+    n_epochs = 50
     model_pth = "fetch_pick_and_place/expert-v0"
 
     # Uncomment to train a new model

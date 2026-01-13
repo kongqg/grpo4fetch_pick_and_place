@@ -69,5 +69,5 @@ def get_expert_demo(dataset_id: str, n_episodes:int=100, visualize:bool = True) 
 
 if __name__ == "__main__":
     # Change the version accordingly
-    dataset_id = "fetch_pick_and_place/expert-v0"
+    dataset_id = "fetch_pick_and_place_backup/expert-v0"
     get_expert_demo(dataset_id, n_episodes=2_000, visualize=True)

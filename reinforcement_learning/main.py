@@ -36,7 +36,7 @@ if __name__ == '__main__':
     n_epochs = 3
     alpha = 1e-4
     policy_clip = 0.2
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=0)
     flat = _flatten_obs(obs)
     algo = "grpo"
     if algo == "grpo":
@@ -45,11 +45,11 @@ if __name__ == '__main__':
         agent = PPOAgent(n_actions=env.action_space.shape[0], batch_size=batch_size, N=update_every, alpha=alpha,
                           policy_clip=policy_clip, n_epochs=n_epochs, input_dims=(flat.shape[0],))
     bc_state = torch.load(
-        "../imitation-learning-pusher/models/fetch_pick_and_place/expert-v0.pth",
+        "../imitation_learning_pusher/models/fetch_pick_and_place/expert-v0.pth",
         map_location="cpu"
     )
     agent.load_bc_weights(bc_state)
-    n_episodes = 5000
+    n_episodes = 1814
 
     if not os.path.exists('plots'):
         os.makedirs('plots')
@@ -68,17 +68,21 @@ if __name__ == '__main__':
 
 
     total_timesteps = 60000 # compare by env steps
-    group_size = 32 # trajectories per "problem" in GRPO
+    group_size = 8 # trajectories per "problem" in GRPO
 
     episode = 0
     group_id = 0
+    groups_per_update = 8  # 你想攒 8 个不同问题
+    group_traj = []
+    groups_collected = 0
 
-    while global_step < total_timesteps:
+    while episode < n_episodes:
         # =========================
         # GRPO pipeline
         # =========================
         if algo == "grpo":
-            seed = group_id  # same seed => (roughly) same initial state/goal
+            seed = group_id + 1  # same seed => (roughly) same initial state/goal
+            gid = group_id
             group_id += 1
 
             # 1) collect n_rollouts full trajectories under the same "problem"
@@ -91,26 +95,22 @@ if __name__ == '__main__':
                 ep_success = 0
                 ep_len = 0
 
-                while (not done) and (global_step < total_timesteps):
-                    action, prob, val = agent.choose_action(observation)
+                while not done:
+                    action, prob = agent.choose_action(observation)
 
                     obs_, reward, terminated, truncated, info = env.step(action)
                     ep_len += 1
                     observation_ = _flatten_obs(obs_)
+                    # state, action, reward, next_state, done
+
 
                     is_success = int(info.get("is_success", 0))
                     ep_success = max(ep_success, is_success)
 
                     done = terminated or truncated or (is_success == 1)
+                    group_traj.append([observation, action, reward, observation_, done, prob, group_id])
                     score += reward
                     ep_success = max(ep_success, int(info.get("is_success", 0)))
-
-                    # hard stop on step budget (so PPO/GRPO compare with identical env steps)
-                    if global_step + 1 >= total_timesteps:
-                        done = True
-
-                    agent.remember(observation, action, prob, val, reward, done)
-
                     observation = observation_
                     global_step += 1
 
@@ -153,18 +153,19 @@ if __name__ == '__main__':
                     break
 
             # 2) update policy once per group
-            stats = agent.learn_grpo(debug=True)
-            if stats is not None:
-                for k, v in stats.items():
-                    writer.add_scalar(k, v, global_step)
-            writer.flush()
-            learn_iters += 1
+            if group_id % 8 == 0:
+                stats = agent.learn_grpo(group_traj)
+                if stats is not None:
+                    for k, v in stats.items():
+                        writer.add_scalar(k, v, global_step)
+                learn_iters += 1
+                group_traj = []
 
         # =========================
         # PPO pipeline (your original)
         # =========================
         else:
-            obs, info = env.reset()
+            obs, info = env.reset(seed=group_id)
             observation = _flatten_obs(obs)
 
             done = False
@@ -172,7 +173,7 @@ if __name__ == '__main__':
             ep_success = 0
             ep_len = 0
 
-            while (not done) and (global_step < total_timesteps):
+            while not done:
                 action, prob, val = agent.choose_action(observation)
 
                 obs_, reward, terminated, truncated, info = env.step(action)
@@ -185,10 +186,6 @@ if __name__ == '__main__':
                 done = terminated or truncated or (is_success == 1)
                 score += reward
                 ep_success = max(ep_success, int(info.get("is_success", 0)))
-
-                # hard stop on step budget
-                if global_step + 1 >= total_timesteps:
-                    done = True
 
                 agent.remember(observation, action, prob, val, reward, done)
 
